@@ -4,11 +4,19 @@ The source models a chain as an append-only set of immutable blocks plus a
 canonical height -> hash mapping whose head can move.  Every head change bumps
 a monotonically increasing revision number.  Blocks are addressed by hash, so
 old branches remain readable after a reorg (the source never deletes blocks).
+
+Persistence is save-first: advance/fork/rollback stage their change, write the
+resulting state to disk, and only then make the new head, revision and blocks
+visible.  A failed save leaves the last persisted chain fully served, keeps
+the failed operation's blocks invisible, and does not consume revision, nonce
+or tx serial numbers — so retrying the same operation (before or after a
+restart) regenerates the identical revision and block hashes.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import os
@@ -79,6 +87,24 @@ class Head:
         }
 
 
+@dataclass
+class _PendingChange:
+    """A staged chain mutation, fully described before it is persisted.
+
+    Everything needed to undo/discard a failed change lives here and only
+    here, so the extra memory grows with the number of blocks touched by this
+    one operation — never with the size of the chain.
+    """
+
+    new_blocks: list[Block]
+    canonical_updates: dict[int, str]
+    canonical_removals: set[int]
+    head_hash: str
+    revision: int
+    nonce: int
+    tx_serial: int
+
+
 class ChainState:
     """Thread-safe chain state with optional JSON persistence."""
 
@@ -109,6 +135,7 @@ class ChainState:
             "delay_ms": 0,
             "head_failures": 0,
             "block_failures": 0,
+            "save_failures": 0,
             "fail_all": False,
             "status_code": 503,
         }
@@ -117,8 +144,9 @@ class ChainState:
         if not loaded:
             self._init_genesis()
             if initial_blocks > 0:
-                self._advance_locked(initial_blocks, initial_transfers_per_block)
-            self._save()
+                self.advance(initial_blocks, initial_transfers_per_block)
+            else:
+                self._save()
 
     # ------------------------------------------------------------------ state
     @property
@@ -164,11 +192,19 @@ class ChainState:
             height=height, hash=block_hash, parent_hash=parent_hash, transfers=transfers
         )
 
-    def _generate_transfers(self, height: int, count: int, salt: str) -> list[Transfer]:
+    def _generate_transfers(
+        self, height: int, count: int, salt: str, tx_serial: int
+    ) -> tuple[list[Transfer], int]:
+        """Build deterministic transfers without mutating any state.
+
+        Returns the transfers plus the tx serial that would result; the caller
+        only stores it when the staged change is committed, so a failed save
+        never consumes serials and a retry reproduces identical txids.
+        """
         transfers: list[Transfer] = []
         for i in range(count):
-            self.tx_serial += 1
-            seed = f"tx:{salt}:{height}:{i}:{self.tx_serial}"
+            tx_serial += 1
+            seed = f"tx:{salt}:{height}:{i}:{tx_serial}"
             digest = _sha256_text(seed)
             sender_idx = (height + i) % len(self.addresses)
             receiver_idx = (sender_idx + 1) % len(self.addresses)
@@ -187,30 +223,73 @@ class ChainState:
                     amount=amount,
                 )
             )
-        return transfers
+        return transfers, tx_serial
 
-    def _advance_locked(self, count: int, transfers_per_block: int) -> list[Block]:
+    def _stage_extension(
+        self,
+        ancestor: Block,
+        count: int,
+        transfers_per_block: int,
+        salt_prefix: str,
+    ) -> tuple[list[Block], int, int]:
+        """Build ``count`` new blocks on top of ``ancestor`` without mutating.
+
+        Returns the created blocks plus the nonce/tx_serial values that would
+        result from committing them.  Because nothing is consumed here, a
+        failed save followed by a retry of the same operation regenerates the
+        identical salts, and therefore identical block hashes.
+        """
         created: list[Block] = []
-        current = self.head
+        nonce = self.nonce
+        tx_serial = self.tx_serial
+        current = ancestor
         for _ in range(count):
             height = current.height + 1
-            self.nonce += 1
-            salt = f"advance:{self.nonce}:{height}"
-            transfers = self._generate_transfers(height, transfers_per_block, salt)
+            nonce += 1
+            salt = f"{salt_prefix}:{nonce}:{height}"
+            transfers, tx_serial = self._generate_transfers(
+                height, transfers_per_block, salt, tx_serial
+            )
             block = self._make_block(height, current.hash, transfers, salt)
-            self.blocks[block.hash] = block
-            self.canonical[height] = block.hash
-            self.head_hash = block.hash
-            self.revision += 1
-            current = block
             created.append(block)
-        return created
+            current = block
+        return created, nonce, tx_serial
+
+    def _commit(self, pending: _PendingChange) -> None:
+        """Persist a staged change, then — and only then — make it visible.
+
+        If the save raises, the live state is left exactly as it was: reads
+        keep serving the last persisted chain, the staged blocks stay
+        invisible, and revision/nonce/tx_serial are not consumed.
+        """
+        self._save(pending)
+        for block in pending.new_blocks:
+            self.blocks[block.hash] = block
+        for height in pending.canonical_removals:
+            self.canonical.pop(height, None)
+        self.canonical.update(pending.canonical_updates)
+        self.head_hash = pending.head_hash
+        self.revision = pending.revision
+        self.nonce = pending.nonce
+        self.tx_serial = pending.tx_serial
 
     # --------------------------------------------------------------- controls
     def advance(self, count: int, transfers_per_block: int = 0) -> list[Block]:
         with self.lock:
-            created = self._advance_locked(count, transfers_per_block)
-            self._save()
+            created, nonce, tx_serial = self._stage_extension(
+                self.head, count, transfers_per_block, "advance"
+            )
+            self._commit(
+                _PendingChange(
+                    new_blocks=created,
+                    canonical_updates={b.height: b.hash for b in created},
+                    canonical_removals=set(),
+                    head_hash=created[-1].hash if created else self.head_hash,
+                    revision=self.revision + len(created),
+                    nonce=nonce,
+                    tx_serial=tx_serial,
+                )
+            )
             return created
 
     def fork(
@@ -226,26 +305,22 @@ class ChainState:
             ancestor = self.blocks[self.canonical[from_height]]
             if not (0 <= from_height <= self.head.height):
                 raise ValueError("from_height out of range")
-            # Drop the superseded canonical suffix; retain immutable blocks.
-            for h in [h for h in self.canonical if h > from_height]:
-                del self.canonical[h]
-            current = ancestor
-            created: list[Block] = []
-            for _ in range(count):
-                height = current.height + 1
-                self.nonce += 1
-                branch_salt = f"fork:{salt or 'branch'}:{self.nonce}:{height}"
-                transfers = self._generate_transfers(
-                    height, transfers_per_block, branch_salt
+            # The superseded canonical suffix is dropped; immutable blocks stay.
+            removals = {h for h in self.canonical if h > from_height}
+            created, nonce, tx_serial = self._stage_extension(
+                ancestor, count, transfers_per_block, f"fork:{salt or 'branch'}"
+            )
+            self._commit(
+                _PendingChange(
+                    new_blocks=created,
+                    canonical_updates={b.height: b.hash for b in created},
+                    canonical_removals=removals,
+                    head_hash=created[-1].hash if created else ancestor.hash,
+                    revision=self.revision + len(created),
+                    nonce=nonce,
+                    tx_serial=tx_serial,
                 )
-                block = self._make_block(height, current.hash, transfers, branch_salt)
-                self.blocks[block.hash] = block
-                self.canonical[height] = block.hash
-                self.head_hash = block.hash
-                self.revision += 1
-                current = block
-                created.append(block)
-            self._save()
+            )
             return created
 
     def rollback(self, to_height: int) -> Block:
@@ -254,11 +329,18 @@ class ChainState:
                 raise ValueError(f"no canonical block at height {to_height}")
             if to_height >= self.head.height:
                 raise ValueError("rollback target must be below the current head")
-            for h in [h for h in self.canonical if h > to_height]:
-                del self.canonical[h]
-            self.head_hash = self.canonical[to_height]
-            self.revision += 1
-            self._save()
+            removals = {h for h in self.canonical if h > to_height}
+            self._commit(
+                _PendingChange(
+                    new_blocks=[],
+                    canonical_updates={},
+                    canonical_removals=removals,
+                    head_hash=self.canonical[to_height],
+                    revision=self.revision + 1,
+                    nonce=self.nonce,
+                    tx_serial=self.tx_serial,
+                )
+            )
             return self.head
 
     def set_faults(self, config: dict[str, Any]) -> dict[str, Any]:
@@ -271,22 +353,61 @@ class ChainState:
             return dict(self.faults)
 
     # ------------------------------------------------------------- persistence
-    def _save(self) -> None:
+    def _save(self, pending: _PendingChange | None = None) -> None:
+        """Persist the chain state, optionally overlaid with a staged change.
+
+        The write is atomic (tmp file + ``os.replace``), so the state file
+        always holds the last *complete* save.  When ``pending`` is given the
+        file reflects the staged change while the live in-memory state is only
+        updated after the save succeeds (see ``_commit``); on failure nothing
+        visible changes.
+        """
         if not self.state_path:
             return
-        self.state_path.parent.mkdir(parents=True, exist_ok=True)
+        save_failures = int(self.faults.get("save_failures", 0))
+        if save_failures > 0:
+            self.faults["save_failures"] = save_failures - 1
+            raise OSError("simulated chain source save failure")
+        blocks = self.blocks
+        canonical = self.canonical
+        revision = self.revision
+        head_hash = self.head_hash
+        nonce = self.nonce
+        tx_serial = self.tx_serial
+        if pending is not None:
+            blocks = dict(self.blocks)
+            for block in pending.new_blocks:
+                blocks[block.hash] = block
+            canonical = {
+                height: block_hash
+                for height, block_hash in self.canonical.items()
+                if height not in pending.canonical_removals
+            }
+            canonical.update(pending.canonical_updates)
+            revision = pending.revision
+            head_hash = pending.head_hash
+            nonce = pending.nonce
+            tx_serial = pending.tx_serial
         payload = {
             "version": 1,
-            "revision": self.revision,
-            "head_hash": self.head_hash,
-            "nonce": self.nonce,
-            "tx_serial": self.tx_serial,
-            "canonical": {str(h): hh for h, hh in sorted(self.canonical.items())},
-            "blocks": {h: b.as_dict() for h, b in self.blocks.items()},
+            "revision": revision,
+            "head_hash": head_hash,
+            "nonce": nonce,
+            "tx_serial": tx_serial,
+            "canonical": {str(h): hh for h, hh in sorted(canonical.items())},
+            "blocks": {h: b.as_dict() for h, b in blocks.items()},
         }
+        self.state_path.parent.mkdir(parents=True, exist_ok=True)
         tmp = self.state_path.with_suffix(self.state_path.suffix + ".tmp")
-        tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
-        os.replace(tmp, self.state_path)
+        try:
+            tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, self.state_path)
+        except OSError:
+            # Never leave a partial state file behind: the previous complete
+            # save stays untouched at state_path.
+            with contextlib.suppress(OSError):
+                tmp.unlink()
+            raise
 
     def _load(self) -> bool:
         if not self.state_path or not self.state_path.exists():
@@ -343,6 +464,7 @@ class FaultRequest(BaseModel):
     delay_ms: int = Field(default=0, ge=0, le=600_000)
     head_failures: int = Field(default=0, ge=0)
     block_failures: int = Field(default=0, ge=0)
+    save_failures: int = Field(default=0, ge=0)
     fail_all: bool = False
     status_code: int = Field(default=503, ge=400, le=599)
 
@@ -364,8 +486,11 @@ def create_app(state: ChainState | None = None) -> FastAPI:
         description=(
             "Controllable local chain used for demos and tests. Every head change "
             "increments `revision`; blocks are immutable and fetched by hash. "
-            "Use /admin/advance, /admin/fork, /admin/rollback and /admin/faults "
-            "to drive the source."
+            "Advance/fork/rollback are save-first: the new head, revision and "
+            "blocks become visible only after the state is persisted, and a "
+            "failed save leaves the last saved chain served (retry is safe and "
+            "deterministic). Use /admin/advance, /admin/fork, /admin/rollback "
+            "and /admin/faults to drive the source."
         ),
     )
     app.state.chain = state
@@ -456,7 +581,12 @@ def create_app(state: ChainState | None = None) -> FastAPI:
     @app.post("/admin/advance", tags=["admin"])
     async def advance(body: AdvanceRequest):
         with state.lock:
-            created = state.advance(body.count, body.transfers_per_block)
+            try:
+                created = state.advance(body.count, body.transfers_per_block)
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=503, detail=f"chain state save failed: {exc}"
+                ) from exc
             return {
                 "head": state.head.as_dict(),
                 "created": [
@@ -480,6 +610,10 @@ def create_app(state: ChainState | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=503, detail=f"chain state save failed: {exc}"
+                ) from exc
             return {
                 "common_ancestor": {
                     "height": ancestor.height,
@@ -501,6 +635,10 @@ def create_app(state: ChainState | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail=str(exc)) from exc
             except ValueError as exc:
                 raise HTTPException(status_code=400, detail=str(exc)) from exc
+            except OSError as exc:
+                raise HTTPException(
+                    status_code=503, detail=f"chain state save failed: {exc}"
+                ) from exc
             return {"head": new_head.as_dict()}
 
     @app.post("/admin/faults", tags=["admin"])

@@ -413,11 +413,21 @@ DEMO_HTML = """<!doctype html>
           <button class="ghost" onclick="fail()">inject failures</button>
         </div>
       </div>
-      <label>slow pull: delay every source response (ms)</label>
-      <input id="delay" type="number" value="0" min="0" step="250">
-      <button class="ghost" onclick="slow()">apply delay</button>
+      <div class="grid2">
+        <div>
+          <label>simulate save failure (next N state writes)</label>
+          <input id="saveFailures" type="number" value="1" min="1">
+          <button class="ghost" onclick="failSave()">inject save failures</button>
+        </div>
+        <div>
+          <label>slow pull: delay every source response (ms)</label>
+          <input id="delay" type="number" value="0" min="0" step="250">
+          <button class="ghost" onclick="slow()">apply delay</button>
+        </div>
+      </div>
       <p class="hint">Advanced controls call the chain source directly through
-        this console's /demo proxy.</p>
+        this console's /demo proxy. A failed save leaves the last saved chain
+        served; retry the same operation after clearing faults.</p>
     </div>
   </section>
 </main>
@@ -508,18 +518,24 @@ function renderTxs(rows) {
 }
 
 async function advance() {
-  await source('/admin/advance', {method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({count: +$('advCount').value, transfers_per_block: 2})});
+  try {
+    await source('/admin/advance', {method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({count: +$('advCount').value, transfers_per_block: 2})});
+  } catch (e) { $('round').textContent = 'advance failed (chain unchanged): ' + String(e); }
   await sync();
 }
 async function fork() {
-  await source('/admin/fork', {method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({from_height: +$('forkFrom').value, count: 3, transfers_per_block: 2})});
+  try {
+    await source('/admin/fork', {method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({from_height: +$('forkFrom').value, count: 3, transfers_per_block: 2})});
+  } catch (e) { $('round').textContent = 'fork failed (chain unchanged): ' + String(e); }
   await sync(); if (lastQuery) query();
 }
 async function rollback() {
-  await source('/admin/rollback', {method:'POST', headers:{'content-type':'application/json'},
-    body: JSON.stringify({to_height: +$('rollbackTo').value})});
+  try {
+    await source('/admin/rollback', {method:'POST', headers:{'content-type':'application/json'},
+      body: JSON.stringify({to_height: +$('rollbackTo').value})});
+  } catch (e) { $('round').textContent = 'rollback failed (chain unchanged): ' + String(e); }
   await sync(); if (lastQuery) query();
 }
 async function fail() {
@@ -527,6 +543,13 @@ async function fail() {
   await source('/admin/faults', {method:'POST', headers:{'content-type':'application/json'},
     body: JSON.stringify({head_failures: n, block_failures: n})});
   await sync();
+}
+async function failSave() {
+  const n = +$('saveFailures').value;
+  await source('/admin/faults', {method:'POST', headers:{'content-type':'application/json'},
+    body: JSON.stringify({save_failures: n})});
+  $('round').textContent = `next ${n} state save(s) will fail; ` +
+    'advance/fork/rollback will return 503 and leave the chain unchanged';
 }
 async function slow() {
   await source('/admin/faults', {method:'POST', headers:{'content-type':'application/json'},

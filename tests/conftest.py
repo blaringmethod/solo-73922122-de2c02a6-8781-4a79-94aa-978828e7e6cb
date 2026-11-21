@@ -26,8 +26,8 @@ def _free_port() -> int:
 
 
 class LiveServer:
-    def __init__(self, app) -> None:
-        self.port = _free_port()
+    def __init__(self, app, port: int | None = None) -> None:
+        self.port = port or _free_port()
         self.server = uvicorn.Server(
             uvicorn.Config(
                 app,
@@ -71,12 +71,20 @@ class Stack:
     source_url: str
     settings: Settings
     api_servers: list[LiveServer]
+    source_state_path: str = ""
 
     def source_client(self) -> httpx.Client:
         return self.source_server.client()
 
     def api(self, index: int = 0) -> httpx.Client:
         return self.api_servers[index].client()
+
+    def restart_source(self) -> None:
+        """Restart the chain source on the same port from its persisted state."""
+        port = self.source_server.port
+        self.source_server.stop()
+        self.source = ChainState(state_path=self.source_state_path)
+        self.source_server = LiveServer(create_source_app(self.source), port=port)
 
     def add_api(self, instance_id: str | None = None, start_follower: bool = False):
         settings = Settings(
@@ -123,6 +131,7 @@ def stack(tmp_path: Path):
         source_url=source_server.base_url,
         settings=Settings.from_env(),  # placeholder, replaced in add_api
         api_servers=[],
+        source_state_path=str(state_path),
     )
     stack.add_api("instance-a")
     try:

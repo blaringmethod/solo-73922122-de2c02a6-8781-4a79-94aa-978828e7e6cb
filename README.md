@@ -52,6 +52,17 @@ curl -X POST http://localhost:9100/admin/faults \
 curl -X POST http://localhost:8000/admin/sync
 curl -X POST http://localhost:9100/admin/faults \
   -H 'content-type: application/json' -d '{}'
+
+# simulate a failing state save on the source: the last saved chain stays
+# served, the failed operation is invisible, and a retry is deterministic
+curl -X POST http://localhost:9100/admin/faults \
+  -H 'content-type: application/json' -d '{"save_failures":1}'
+curl -X POST http://localhost:9100/admin/advance \
+  -H 'content-type: application/json' -d '{"count":2}'   # 503, chain unchanged
+curl http://localhost:9100/head                          # still the saved head
+curl -X POST http://localhost:9100/admin/advance \
+  -H 'content-type: application/json' -d '{"count":2}'   # retry succeeds
+curl -X POST http://localhost:8000/admin/sync
 ```
 
 Local (no Docker), Python 3.11+:
@@ -59,7 +70,7 @@ Local (no Docker), Python 3.11+:
 ```bash
 python -m venv .venv && . .venv/bin/activate
 pip install -r requirements-dev.txt
-pytest -q                      # 25 end-to-end tests
+pytest -q                      # 37 end-to-end tests
 
 # terminals 1-3
 SOURCE_STATE_PATH=/tmp/chain-source.json INITIAL_BLOCKS=6 \
@@ -141,12 +152,32 @@ increasing `revision`. Control endpoints:
 | POST   | `/admin/advance`    | Append `count` blocks |
 | POST   | `/admin/fork`       | Replace the canonical suffix above `from_height` |
 | POST   | `/admin/rollback`   | Move the head down to `to_height` |
-| POST   | `/admin/faults`     | `delay_ms`, `head_failures`, `block_failures`, `fail_all` |
+| POST   | `/admin/faults`     | `delay_ms`, `head_failures`, `block_failures`, `save_failures`, `fail_all` |
 | GET    | `/admin/stats`      | Per-block request counts (proves no refetching) |
 | GET    | `/docs`             | Swagger UI |
 
 A transfer is `{txid, from_address, to_address, amount}` with an integer
 `amount`; `from`/`to` aliases are also emitted.
+
+**Head changes are save-first.** `advance`/`fork`/`rollback` stage their
+change, persist the resulting state (atomic tmp-file + rename), and only then
+make the new head, revision and blocks visible. If the save fails (inject with
+`save_failures`), the operation answers `503` and:
+
+* `/head`, `/canonical/*` and `/blocks/*` keep serving the last **saved**
+  chain — the unsaved revision is never exposed, so followers never publish a
+  view the source cannot reproduce after a restart;
+* blocks created by the failed operation stay invisible (the immutable
+  by-hash cache only gains blocks once their state is persisted), while
+  previously saved abandoned branches remain fetchable by hash;
+* revision, nonce and tx serials are not consumed, so retrying the same
+  operation — before or after a source restart — regenerates the identical
+  revision and block hashes, provided nothing else succeeded in between.
+
+The staging area holds only the blocks touched by the operation in flight, so
+the extra memory needed to discard a failed change grows with that operation's
+block count, not with the chain size. The state file format is unchanged
+(`version: 1`), and existing state files load as before.
 
 ## Persistence schema
 
@@ -159,7 +190,7 @@ A transfer is `{txid, from_address, to_address, amount}` with an integer
 
 ## Verified behaviour (tests)
 
-`pytest` runs 25 end-to-end tests against real HTTP servers on ephemeral
+`pytest` runs 37 end-to-end tests against real HTTP servers on ephemeral
 ports and a real SQLite file. They cover: the two-block confirmation cutoff and
 that it cannot be lowered; every address seeing the identical complete view;
 reorg suffix-only update with no common-prefix refetch (asserted from
@@ -169,7 +200,12 @@ leaving the published view intact; slow pulls not delaying queries; genuinely
 late rounds rejected after a newer publish; two instances converging from a
 shared volume; restart resuming without refetching; crash-cached blocks reused;
 same-head revision bumps; source state persistence; and `/docs`/console
-availability.
+availability. The save-first guarantee is covered directly: failed
+advance/fork/rollback saves leave `/head`, `/canonical/*`, `/blocks/*` and the
+state file byte-identical; failed operations never consume revision/nonce/tx
+serials; retries — including after a source restart — reproduce the identical
+revision and block hashes; and a follower never publishes an unsaved revision
+nor wedges on a retried one.
 
 ## Known limits
 
@@ -186,6 +222,11 @@ availability.
   of the head, per the documented formula; there is no separate finality rule.
 * The demo console is intentionally unauthenticated and bound to the host's
   published ports; keep it off untrusted networks.
+* The chain source rewrites its whole JSON state file on every head change
+  (O(chain size) per save); the save is on the admin operation's critical
+  path, which is exactly what makes the save-first guarantee possible.
+  `save_failures` is a simulation hook — real disk errors surface the same
+  way (the operation answers 503 and the last saved chain stays served).
 * Docker was unavailable in the build sandbox, so the Compose definition and
   Dockerfiles were validated by YAML inspection and by running both ASGI apps
   under Uvicorn with the exact pinned requirements, not by an actual
@@ -195,7 +236,10 @@ availability.
 
 | Check | Result |
 | --- | --- |
-| `pytest` (25 end-to-end tests, real HTTP servers + real SQLite file) | pass, against both the local environment and the exact pinned Docker dependency set (`PYTHONPATH=/tmp/pins`) |
+| `pytest` (37 end-to-end tests, real HTTP servers + real SQLite file) | pass, on the exact pinned dependency set from `requirements-dev.txt` (fastapi 0.115.6, uvicorn 0.34.0, httpx 0.28.1, pydantic 2.10.4, pytest 8.3.4) |
+| Save-failure fault injection (`save_failures`) over live HTTP | advance/fork/rollback answer 503; `/head`, `/canonical/*`, `/blocks/*` and the state file stay at the last saved chain; retry after clearing the fault succeeds with identical revision and hashes |
+| Source restart between failed save and retry | source resumes the last saved revision; the retried operation produces the same revision/hashes and the follower publishes it (no stale wedge) |
+| Live three-service run (source + 2 API instances, compose topology, real sockets) | 42 checks passed: `/docs` on all three, initial follow, save-failure cycles for advance/fork/rollback, restart + deterministic retry, abandoned-branch fetch-by-hash, two-instance convergence, single lease owner |
 | Both ASGI apps under Uvicorn with pinned deps (`chain_source.main:app`, `app.main:app`) | started, served `/health`, `/docs`, `/`, queries, followed source advances and a fork over real sockets |
 | Two instances sharing one SQLite file | identical `/chain/blocks` views; only one held the lease; failed instance kept serving |
 | Restart continuation | persisted view served before any round; subsequent rounds fetched only new blocks (per-hash counters on the source unchanged for known blocks) |
